@@ -6,7 +6,18 @@ import { describe, expect, it } from 'vitest'
 
 function evaluateRunsOn(selector: unknown, context: Record<string, unknown>): unknown {
   if (typeof selector !== 'string') throw new TypeError('Runner selector must be a string')
-  return runInNewContext(selector.trim().slice(3, -2), context, { timeout: 1000 })
+  return evaluateExpression(selector, context)
+}
+
+/**
+ * Evaluate a workflow expression. A `runs-on`/`env` value arrives wrapped in
+ * `${{ }}`; a step `if` arrives bare. Strip the wrapper only when present so
+ * both forms evaluate through the same sandbox.
+ */
+function evaluateExpression(expression: string, context: Record<string, unknown>): unknown {
+  const trimmed = expression.trim()
+  const source = trimmed.startsWith('${{') ? trimmed.slice(3, -2) : trimmed
+  return runInNewContext(source, { fromJSON: JSON.parse, ...context }, { timeout: 1000 })
 }
 
 const root = resolve(import.meta.dirname, '..')
@@ -248,20 +259,23 @@ describe('CI workflow', () => {
     (jobName) => {
       const job = workflowJob(loadWorkflow('.github/workflows/ci.yml'), jobName)
       if (!Array.isArray(job.steps)) throw new TypeError(`${jobName} must define steps`)
-      expect(job.steps[0]).toEqual({
-        name: 'Use runner-owned temporary storage',
-        run: [
-          'echo "TMPDIR=${{ runner.temp }}" >> "$GITHUB_ENV"',
-          ...(jobName === 'node-24-consumers'
-            ? ['echo "PLAYWRIGHT_BROWSERS_PATH=${RUNNER_TEMP%/*}/ms-playwright" >> "$GITHUB_ENV"']
-            : []),
-          '',
-        ].join('\n'),
-      })
+      const temporaryStorage: unknown = job.steps[0]
+      expect(temporaryStorage).toMatchObject({ name: 'Use runner-owned temporary storage' })
+      if (!isRecord(temporaryStorage) || typeof temporaryStorage.run !== 'string') {
+        throw new TypeError(`${jobName} must configure runner-owned temporary storage`)
+      }
+      expect(temporaryStorage.run).toContain('echo "TMPDIR=${{ runner.temp }}" >> "$GITHUB_ENV"')
       if (jobName === 'node-24-consumers') {
+        // Downstream hosted runners use a different Playwright browser layout than
+        // the upstream self-hosted VM, so the step branches on the repository owner.
+        expect(temporaryStorage.run).toContain("GITHUB_REPOSITORY_OWNER\" == 'deepseek-ai'")
+        expect(temporaryStorage.run).toContain('PLAYWRIGHT_BROWSERS_PATH=${RUNNER_TEMP%/*}/ms-playwright')
+        expect(temporaryStorage.run).toContain('PLAYWRIGHT_BROWSERS_PATH=$RUNNER_TEMP/ms-playwright')
         const browserCache: unknown = job.steps.find(step => isRecord(step) && isRecord(step.with)
           && step.with.path === '${{ env.PLAYWRIGHT_BROWSERS_PATH }}')
         expect(browserCache).toMatchObject({ uses: 'actions/cache/restore@v6.1.0' })
+      } else {
+        expect(temporaryStorage.run).not.toContain('PLAYWRIGHT_BROWSERS_PATH')
       }
       const store: unknown = job.steps.find(step => isRecord(step) && step.name === 'Configure pnpm store path')
       expect(store).toMatchObject({
@@ -341,8 +355,11 @@ describe('CI workflow', () => {
       expect(job['runs-on']).toContain('dsh-win-ci')
       expect(job['runs-on']).toContain('dsh-windows-2025-16core')
       const cores = jobName === 'windows-native-tests' ? 2 : 16
-      expect(evaluateRunsOn(job['runs-on'], { vars: { DSH_CI_FAILOVER_WINDOWS: 'blacksmith' } }))
+      expect(evaluateRunsOn(job['runs-on'], { github: { repository_owner: 'deepseek-ai' }, vars: { DSH_CI_FAILOVER_WINDOWS: 'blacksmith' } }))
         .toBe(`blacksmith-${cores}vcpu-windows-2025`)
+      // Downstream repositories route every Windows lane to the standard hosted image.
+      expect(evaluateRunsOn(job['runs-on'], { github: { repository_owner: 'downstream' }, vars: { DSH_CI_FAILOVER_WINDOWS: 'blacksmith' } }))
+        .toBe('windows-2025')
       expect(job.if).toBe("github.event_name == 'pull_request'")
     }
 
@@ -384,7 +401,10 @@ describe('CI workflow', () => {
     }
 
     expect(windowsCoverage.name).toBe('windows node 24 / coverage')
-    expect(windowsCoverage.env).toMatchObject({ DSH_COVERAGE_PARTITIONS: "${{ vars.DSH_CI_FAILOVER_WINDOWS == 'selfhosted' && github.event.pull_request.user.login != 'dependabot[bot]' && '4' || '' }}" })
+    if (!isRecord(windowsCoverage.env)) throw new TypeError('windows-coverage must define env')
+    expect(evaluateRunsOn(windowsCoverage.env.DSH_COVERAGE_PARTITIONS, { github: { repository_owner: 'deepseek-ai', event: { pull_request: { user: { login: 'maintainer' } } } }, vars: { DSH_CI_FAILOVER_WINDOWS: 'selfhosted' } }))
+      .toBe('4')
+    expect(evaluateRunsOn(windowsCoverage.env.DSH_COVERAGE_PARTITIONS, { github: { repository_owner: 'downstream' } })).toBe('2')
     const coverageSteps = windowsCoverage.steps as unknown[]
     const coverageCommands = coverageSteps.filter((step): step is Record<string, unknown> & { run: string } => (
       isRecord(step) && typeof step.run === 'string'
@@ -419,11 +439,12 @@ describe('CI workflow', () => {
       shell: 'pwsh',
       'continue-on-error': true,
       'timeout-minutes': 15,
-      env: {
-        DSH_GATE_FAIL_FAST: '',
-        DSH_PUBLINT_CONCURRENCY: "${{ vars.DSH_CI_FAILOVER_WINDOWS == 'selfhosted' && github.event.pull_request.user.login != 'dependabot[bot]' && '8' || '' }}",
-      },
+      env: { DSH_GATE_FAIL_FAST: '' },
     })
+    if (!isRecord(observational?.env)) throw new TypeError('observational step must define env')
+    expect(evaluateRunsOn(observational.env.DSH_PUBLINT_CONCURRENCY, { github: { repository_owner: 'deepseek-ai', event: { pull_request: { user: { login: 'maintainer' } } } }, vars: { DSH_CI_FAILOVER_WINDOWS: 'selfhosted' } }))
+      .toBe('8')
+    expect(evaluateRunsOn(observational.env.DSH_PUBLINT_CONCURRENCY, { github: { repository_owner: 'downstream' } })).toBe('2')
     expect(observational?.if).toBeUndefined()
     expect(buildCommands.findIndex(step => step.id === 'observational'))
       .toBeGreaterThan(buildCommands.findIndex(step => step.run === 'pnpm run check:ci:windows-blocking'))
@@ -436,8 +457,8 @@ describe('CI workflow', () => {
     expect(report?.run).toContain('::warning::')
     expect(report?.run).toContain('Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append')
 
-    // serial-windows: master-only standby, self-hosted, non-blocking, lives in ci-master.
-    expect(serialWindows.if).toBe("github.event_name == 'push' && github.ref == 'refs/heads/master'")
+    // serial-windows: post-merge standby, self-hosted, non-blocking, upstream-only, lives in ci-master.
+    expect(serialWindows.if).toBe("github.repository_owner == 'deepseek-ai' && github.event_name == 'push' && github.ref == 'refs/heads/master'")
     expect(serialWindows['runs-on']).toEqual(['self-hosted', 'dsh-win-ci', 'windows'])
     expect(serialWindows.name).toBe('serial / windows (self-hosted standby)')
     // Its store must share the ReFS workspace volume for clone; the install
@@ -502,8 +523,11 @@ describe('CI workflow', () => {
       expect(job['runs-on'], `${jobName} runs-on must use the Linux failover switch`).toContain('DSH_CI_FAILOVER_LINUX')
       expect(job['runs-on'], `${jobName} runs-on must not use the Windows failover switch`).not.toContain('DSH_CI_FAILOVER_WINDOWS')
       expect(job['runs-on']).toContain('vm-backup')
-      expect(evaluateRunsOn(job['runs-on'], { vars: { DSH_CI_FAILOVER_LINUX: 'blacksmith' } }))
+      expect(evaluateRunsOn(job['runs-on'], { github: { repository_owner: 'deepseek-ai' }, vars: { DSH_CI_FAILOVER_LINUX: 'blacksmith' } }))
         .toBe(`blacksmith-${jobName === 'node-24' ? 8 : 16}vcpu-ubuntu-2404`)
+      // Downstream repositories route every Linux lane to the standard hosted image.
+      expect(evaluateRunsOn(job['runs-on'], { github: { repository_owner: 'downstream' }, vars: { DSH_CI_FAILOVER_LINUX: 'blacksmith' } }))
+        .toBe('ubuntu-24.04')
     }
     expect(aggregate['runs-on']).toContain('DSH_CI_FAILOVER_LINUX')
     expect(aggregate['runs-on']).not.toContain('DSH_CI_FAILOVER_WINDOWS')
@@ -518,11 +542,11 @@ describe('CI workflow', () => {
       linuxAggregate: aggregate['runs-on'] as string,
       windows: windowsBuild['runs-on'] as string,
     }
-    const evaluate = (expression: string, vars: Record<string, string>, login = 'maintainer'): unknown => {
+    const evaluate = (expression: string, vars: Record<string, string>, login = 'maintainer', owner = 'deepseek-ai'): unknown => {
       return evaluateRunsOn(expression, {
         vars,
         fromJSON: JSON.parse,
-        github: { event: { pull_request: { user: { login } } } },
+        github: { repository_owner: owner, event: { pull_request: { user: { login } } } },
       })
     }
     for (const [name, selector, variable, pool, hosted] of [
@@ -537,6 +561,11 @@ describe('CI workflow', () => {
       expect(evaluate(selector, { [variable]: 'selfhosted' }, 'dependabot[bot]'), `${name} dependabot on selfhosted`).toBe(hosted)
       for (const mode of ['', 'hosted', 'unexpected']) {
         expect(evaluate(selector, { [variable]: mode }), `${name} default on ${mode}`).toBe(hosted)
+      }
+      // Downstream repositories route every value to a standard hosted image.
+      for (const mode of ['', 'selfhosted', 'blacksmith']) {
+        const downstream = name === 'windows lanes' ? 'windows-2025' : name === 'linux gates' ? 'ubuntu-24.04' : 'ubuntu-latest'
+        expect(evaluate(selector, { [variable]: mode }, 'maintainer', 'downstream'), `${name} downstream on ${mode}`).toBe(downstream)
       }
     }
 
@@ -692,14 +721,15 @@ describe('CI workflow', () => {
     })
     expect(prWorkflow.concurrency).toEqual(workflow.concurrency)
 
-    // The exact event sets are what keep master-only jobs out of the PR check
-    // panel: ci-master triggers only on push(master) + workflow_dispatch and
+    // The exact event sets are what keep post-merge jobs out of the PR check
+    // panel: ci-master triggers only on push(main/master) + workflow_dispatch and
     // never on pull_request; ci.yml is exactly pull_request-only. Assert the
     // full sets so losing the wrong event, or gaining an extra one, fails.
     if (!isRecord(workflow.on) || !isRecord(prWorkflow.on)) {
       throw new TypeError('both CI workflows must define on')
     }
     expect(Object.keys(workflow.on).sort()).toEqual(['push', 'workflow_dispatch'])
+    expect(workflowEvent(workflow, 'push').branches).toEqual(['main', 'master'])
     expect(Object.keys(prWorkflow.on)).toEqual(['pull_request'])
 
     // Drills share the parent run’s supersession policy.
@@ -707,14 +737,15 @@ describe('CI workflow', () => {
       const job = workflow.jobs[name]
       if (!isRecord(job)) throw new TypeError(`${name} must be defined`)
       expect(job.concurrency).toBeUndefined()
-      // Standby drills remain post-merge work, but share run cancellation.
-      expect(job.if).toBe("github.event_name == 'push' && github.ref == 'refs/heads/master'")
+      // Standby drills remain post-merge work, upstream-only, but share run cancellation.
+      expect(job.if).toBe("github.repository_owner == 'deepseek-ai' && github.event_name == 'push' && github.ref == 'refs/heads/master'")
     }
 
-    // Pin the post-merge runtime, Wine, and standby inventory.
+    // Pin the post-merge runtime, Wine, and standby inventory. The manual
+    // benchmark and ssh-helper suites are upstream-only and never push-reachable.
     const NOT_PUSH_REACHABLE = new Set([
-      "github.event_name == 'workflow_dispatch' && inputs.suite == 'larger-runner-benchmark'",
-      "github.event_name == 'workflow_dispatch' && inputs.suite == 'consolidated-runner-benchmark'",
+      "github.repository_owner == 'deepseek-ai' && github.event_name == 'workflow_dispatch' && inputs.suite == 'larger-runner-benchmark'",
+      "github.repository_owner == 'deepseek-ai' && github.event_name == 'workflow_dispatch' && inputs.suite == 'consolidated-runner-benchmark'",
       "github.event_name == 'workflow_dispatch' && inputs.suite == 'ssh-helper'",
     ])
     const pushReachable = Object.entries(workflow.jobs)
@@ -918,10 +949,10 @@ describe('CI workflow', () => {
 })
 
 describe('Runtime and LLM e2e Blacksmith routing', () => {
-  it('routes DeepSeek e2e only through the Linux Blacksmith switch', () => {
+  it('routes upstream DeepSeek e2e through the Linux Blacksmith switch', () => {
     const job = workflowJob(loadWorkflow('.github/workflows/e2e.yml'), 'e2e')
     for (const mode of ['', 'selfhosted', 'unexpected', 'blacksmith']) {
-      expect(evaluateRunsOn(job['runs-on'], { vars: { DSH_CI_FAILOVER_LINUX: mode, DSH_CI_FAILOVER_WINDOWS: 'blacksmith' } }))
+      expect(evaluateRunsOn(job['runs-on'], { github: { repository_owner: 'deepseek-ai' }, vars: { DSH_CI_FAILOVER_LINUX: mode, DSH_CI_FAILOVER_WINDOWS: 'blacksmith' } }))
         .toBe(mode === 'blacksmith' ? 'blacksmith-4vcpu-ubuntu-2404' : 'ubuntu-latest')
     }
   })
@@ -940,8 +971,10 @@ describe('Runtime and LLM e2e Blacksmith routing', () => {
         for (const release of [false, true]) {
           for (const mode of ['', 'selfhosted', 'unexpected', 'blacksmith']) {
             const vars = { DSH_CI_FAILOVER_LINUX: 'blacksmith', DSH_CI_FAILOVER_WINDOWS: 'blacksmith', [variable]: mode }
-            expect(evaluateRunsOn(build['runs-on'], { inputs: { ci, release }, vars, matrix: { target, runner } }), `${target} ci=${ci} release=${release} mode=${mode}`)
+            expect(evaluateRunsOn(build['runs-on'], { github: { repository_owner: 'deepseek-ai' }, inputs: { ci, release }, vars, matrix: { target, runner } }), `${target} ci=${ci} release=${release} mode=${mode}`)
               .toBe(release ? releaseRunner : ci && mode === 'blacksmith' ? blacksmith : runner)
+            expect(evaluateRunsOn(build['runs-on'], { github: { repository_owner: 'downstream' }, inputs: { ci, release }, vars, matrix: { target, runner } }), `downstream ${target} release=${release}`)
+              .toBe(release ? releaseRunner : runner)
           }
         }
       }
@@ -953,8 +986,10 @@ describe('Runtime and LLM e2e Blacksmith routing', () => {
     for (const ci of [false, true]) {
       for (const release of [false, true]) {
         for (const mode of ['', 'selfhosted', 'unexpected', 'blacksmith']) {
-          expect(evaluateRunsOn(job['runs-on'], { inputs: { ci, release }, vars: { DSH_CI_FAILOVER_LINUX: mode } }))
+          expect(evaluateRunsOn(job['runs-on'], { github: { repository_owner: 'deepseek-ai' }, inputs: { ci, release }, vars: { DSH_CI_FAILOVER_LINUX: mode } }))
             .toBe(ci && !release && mode === 'blacksmith' ? 'blacksmith-4vcpu-ubuntu-2404' : 'ubuntu-latest')
+          expect(evaluateRunsOn(job['runs-on'], { github: { repository_owner: 'downstream' }, inputs: { ci, release }, vars: { DSH_CI_FAILOVER_LINUX: mode } }))
+            .toBe('ubuntu-latest')
         }
       }
     }
@@ -1111,6 +1146,7 @@ describe('Python release workflows', () => {
     expect(call.inputs).toMatchObject({
       ci: { type: 'boolean', default: false },
       release: { type: 'boolean', default: false },
+      real_api: { type: 'boolean', default: false },
     })
     expect(call.secrets).toMatchObject({
       DEEPSEEK_API_KEY_EXTERNAL: { required: false },
@@ -1159,7 +1195,7 @@ describe('Python release workflows', () => {
     expect(realApiPreflightPosix).toMatchObject({
       env: { DEEPSEEK_API_KEY: '${{ secrets.DEEPSEEK_API_KEY_EXTERNAL }}' },
     })
-    expect(String(realApiPreflightPosix.if)).toContain('inputs.ci')
+    expect(String(realApiPreflightPosix.if)).toContain('inputs.real_api')
     expect(String(realApiPreflightPosix.if)).toContain('head.repo.fork')
     expect(String(realApiPreflightPosix.if)).toContain('dependabot[bot]')
     expect(realApiPreflightWindows).toMatchObject({ shell: 'pwsh' })
@@ -1528,6 +1564,147 @@ describe('Git hooks', () => {
 
       expect(pairing).toMatchObject({ exclude: ['.agents/notes/archived/**'] })
     }
+  })
+})
+
+describe('downstream hosted CI overlay', () => {
+  const downstream = (mode: string) => ({
+    vars: { DSH_CI_FAILOVER_LINUX: mode, DSH_CI_FAILOVER_WINDOWS: mode },
+    matrix: { runner: 'ubuntu-latest' },
+    github: {
+      repository_owner: 'downstream',
+      repository: 'downstream/project',
+      event: { pull_request: { head: { repo: { full_name: 'downstream/project', fork: false } }, user: { login: 'maintainer' } } },
+    },
+  })
+
+  it('routes every pull-request lane to standard hosted runners regardless of upstream failover variables', () => {
+    const ci = loadWorkflow('.github/workflows/ci.yml')
+    for (const mode of ['', 'selfhosted', 'blacksmith']) {
+      for (const [name, expected] of [
+        ['node-24', 'ubuntu-24.04'],
+        ['node-24-coverage', 'ubuntu-24.04'],
+        ['node-24-consumers', 'ubuntu-24.04'],
+        ['node-compat', 'ubuntu-latest'],
+        ['windows-build', 'windows-2025'],
+        ['windows-coverage', 'windows-2025'],
+        ['windows-native-tests', 'windows-2025'],
+        ['all-checks-passed', 'ubuntu-latest'],
+      ] as const) {
+        expect(evaluateRunsOn(workflowJob(ci, name)['runs-on'], downstream(mode)), `${name} ${mode}`).toBe(expected)
+      }
+    }
+  })
+
+  it('bounds downstream worker budgets below the upstream shared-host values', () => {
+    const ci = loadWorkflow('.github/workflows/ci.yml')
+    const staticEnv = workflowJob(ci, 'node-24').env
+    const coverageEnv = workflowJob(ci, 'node-24-coverage').env
+    const consumersEnv = workflowJob(ci, 'node-24-consumers').env
+    if (!isRecord(staticEnv) || !isRecord(coverageEnv) || !isRecord(consumersEnv)) {
+      throw new TypeError('downstream Linux jobs must define worker budgets')
+    }
+    expect(evaluateRunsOn(staticEnv.DSH_GATE_CONCURRENCY, downstream(''))).toBe('2')
+    expect(evaluateRunsOn(coverageEnv.DSH_COVERAGE_MAX_WORKERS, downstream(''))).toBe('2')
+    expect(evaluateRunsOn(coverageEnv.DSH_COVERAGE_PARTITIONS, downstream(''))).toBe('2')
+    expect(evaluateRunsOn(coverageEnv.DSH_GATE_CONCURRENCY, downstream(''))).toBe('1')
+    expect(evaluateRunsOn(consumersEnv.DSH_SNAPSHOT_MAX_CONCURRENCY, downstream(''))).toBe('4')
+  })
+
+  it('keeps hosted setup steps active downstream and skips the self-hosted-only steps', () => {
+    const ci = loadWorkflow('.github/workflows/ci.yml')
+    for (const mode of ['', 'selfhosted', 'blacksmith']) {
+      for (const name of ['node-24', 'node-24-coverage', 'node-24-consumers']) {
+        const job = workflowJob(ci, name)
+        if (!Array.isArray(job.steps)) throw new TypeError(`${name} must define steps`)
+        for (const step of job.steps.filter(isRecord).filter(step => step.uses === 'actions/cache/restore@v6.1.0' && typeof step.if === 'string')) {
+          expect(evaluateExpression(String(step.if), downstream(mode)), `${name} cache ${mode}`).toBe(true)
+        }
+      }
+      const consumers = workflowJob(ci, 'node-24-consumers')
+      if (!Array.isArray(consumers.steps)) throw new TypeError('node-24-consumers must define steps')
+      const hostedBrowser = consumers.steps.filter(isRecord).find(step => step.name === 'Install Playwright Chromium, WebKit, and hosted dependencies')
+      const persistentBrowser = consumers.steps.filter(isRecord).find(step => step.name === 'Install Playwright Chromium and WebKit on the failover VM')
+      if (!isRecord(hostedBrowser) || !isRecord(persistentBrowser)) throw new TypeError('consumer browser setup steps are required')
+      expect(evaluateExpression(String(hostedBrowser.if), downstream(mode))).toBe(true)
+      expect(evaluateExpression(String(persistentBrowser.if), downstream(mode))).toBe(false)
+    }
+  })
+
+  it('keeps post-merge and manual owner-restricted jobs out of downstream execution', () => {
+    const master = loadWorkflow('.github/workflows/ci-master.yml')
+    for (const name of ['serial-linux-selfhosted', 'serial-windows', 'larger-runner-benchmark', 'consolidated-runner-benchmark']) {
+      expect(workflowJob(master, name).if, name).toContain("github.repository_owner == 'deepseek-ai'")
+    }
+    const sandbox = loadWorkflow('.github/workflows/sandbox.yml')
+    for (const mode of ['', 'selfhosted', 'blacksmith']) {
+      expect(evaluateRunsOn(workflowJob(sandbox, 'sandbox-e2e')['runs-on'], {
+        github: { repository_owner: 'downstream' },
+        vars: { DSH_CI_FAILOVER_LINUX: mode },
+        matrix: { runner: 'bwrap', os: 'ubuntu-latest' },
+      })).toBe('ubuntu-latest')
+    }
+  })
+
+  it('keeps main and master in post-merge push triggers and gates live API on the upstream owner', () => {
+    expect(workflowEvent(loadWorkflow('.github/workflows/ci-master.yml'), 'push').branches).toEqual(['main', 'master'])
+    expect(workflowEvent(loadWorkflow('.github/workflows/sandbox.yml'), 'push').branches).toEqual(['main', 'master'])
+    expect(workflowEvent(loadWorkflow('.github/workflows/node-addon-system.yml'), 'push').branches).toEqual(['main', 'master'])
+    const ciRuntime = workflowJob(loadWorkflow('.github/workflows/ci.yml'), 'python-runtime')
+    if (!isRecord(ciRuntime.with)) throw new TypeError('python-runtime must pass inputs')
+    expect(ciRuntime.with.real_api).toBe("${{ github.repository_owner == 'deepseek-ai' }}")
+  })
+
+  it('runs the real-API e2e job only on explicit downstream dispatch', () => {
+    const job = workflowJob(loadWorkflow('.github/workflows/e2e.yml'), 'e2e')
+    const context = (eventName: string) => ({
+      github: {
+        repository_owner: 'downstream',
+        event_name: eventName,
+        event: { pull_request: { head: { repo: { fork: false } }, user: { login: 'maintainer' } } },
+      },
+    })
+    expect(evaluateExpression(String(job.if), context('workflow_dispatch'))).toBe(true)
+    expect(evaluateExpression(String(job.if), context('schedule'))).toBe(false)
+    expect(evaluateExpression(String(job.if), context('push'))).toBe(false)
+    for (const mode of ['', 'selfhosted', 'blacksmith']) {
+      expect(evaluateRunsOn(job['runs-on'], { github: { repository_owner: 'downstream' }, vars: { DSH_CI_FAILOVER_LINUX: mode } })).toBe('ubuntu-latest')
+    }
+  })
+
+  it('requires the installed-wheel live API steps to key on the opt-in real_api input', () => {
+    const builder = loadWorkflow('.github/workflows/build-exe-for-python-sdk.yml')
+    const build = workflowJob(builder, 'build')
+    if (!Array.isArray(build.steps)) throw new TypeError('Python runtime build must define steps')
+    const liveSteps = build.steps.filter(isRecord).filter(step => typeof step.name === 'string' && String(step.name).includes('real API'))
+    expect(liveSteps.length).toBe(4)
+    for (const step of liveSteps) {
+      expect(String(step.if)).toContain('inputs.real_api')
+      expect(evaluateExpression(String(step.if), {
+        inputs: { real_api: false },
+        runner: { os: step.name && String(step.name).includes('Windows') ? 'Windows' : 'Linux' },
+        github: { event_name: 'push', event: { pull_request: { head: { repo: { fork: false } }, user: { login: 'maintainer' } } } },
+      })).toBe(false)
+    }
+    const call = workflowEvent(builder, 'workflow_call')
+    const dispatch = workflowEvent(builder, 'workflow_dispatch')
+    if (!isRecord(call.inputs) || !isRecord(dispatch.inputs)) throw new TypeError('builder must declare real_api on both triggers')
+    expect(call.inputs.real_api).toMatchObject({ type: 'boolean', default: false })
+    expect(dispatch.inputs.real_api).toMatchObject({ type: 'boolean', default: false })
+  })
+})
+
+describe('Tauri bundle workflow', () => {
+  it('builds the Tauri bundle from maintained runtime products under its own tag family', () => {
+    const workflow = loadWorkflow('.github/workflows/build-tauri-macos.yml')
+    const build = workflowJob(workflow, 'build')
+    const release = workflowJob(workflow, 'release')
+    if (!Array.isArray(build.steps)) throw new TypeError('Tauri build job must define steps')
+    const commands = build.steps.filter(isRecord).map(step => step.run).filter(value => typeof value === 'string')
+    expect(commands).toContain('pnpm exec tsx scripts/build-tauri-sidecar.ts --targets node24-macos-arm64')
+    expect(commands).toContainEqual(expect.stringContaining('scripts/smoke-tauri-bundle.ts --app'))
+    expect(release.if).toBe("startsWith(github.ref, 'refs/tags/tauri-v')")
+    expect(JSON.stringify(workflow.on)).toContain('tauri-v*')
   })
 })
 

@@ -1,6 +1,28 @@
-# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
-# side as of the last confirmed-consistent state. Both languages carry equal authority;
-# after editing either side, bring the other along and re-record with:
+# Bilingual-pair consistency record for README.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write apps/tauri/README.md
-README.md: 30e7eddb80b729fcc292fc8bf67739543a1c7247
-README.zh.md: 4d431215e3f15d925912d0598b87061e280669c0
+/dsh-tauri:
+  en: 9c23b047525e209d
+  zh: d3f75498b72c2c36
+/dsh-tauri/how-it-works:
+  en: bfecc2bb661c5d3f
+  zh: 0c0d83840779bd7c
+/dsh-tauri/prerequisites:
+  en: 43fbe1c2466a7a13
+  zh: bf45d0b90381e48d
+/dsh-tauri/run-development:
+  en: 14531ca5276a9b44
+  zh: 6bb8520e17a1ff94
+/dsh-tauri/build-the-macos-app:
+  en: e2cffaa5188efeb0
+  zh: 37ae631c3ce15213
+/dsh-tauri/verify-from-source:
+  en: d21e45fd69d20854
+  zh: 4d353cc949250c8f
+/dsh-tauri/configuration:
+  en: 792cba343df5f27e
+  zh: 7fb1fb0befa98de6
+/dsh-tauri/known-limitations-and-next-steps:
+  en: 0a90e1da01632749
+  zh: 7af97e1d8e5acbfc

@@ -1,6 +1,22 @@
-# Bilingual-pair consistency record (docs/i18n/README.md): the git blob hash of each
-# side as of the last confirmed-consistent state. Both languages carry equal authority;
-# after editing either side, bring the other along and re-record with:
+# Bilingual-pair consistency record for 2026-09-15-tauri-thin-web-shell.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write .agents/notes/implemented/architecture/2026-09-15-tauri-thin-web-shell.md
-2026-09-15-tauri-thin-web-shell.md: 0cb505db6dd099779538905f227146aca28eeb95
-2026-09-15-tauri-thin-web-shell.zh.md: d25c8e7450b94595211cd32876af2ed8819f3491
+/agent-note-keep-the-tauri-application-a-thin-web-shell:
+  en: ddd62c5b8a00ade1
+  zh: 3095e031ce045cc4
+/agent-note-keep-the-tauri-application-a-thin-web-shell/problem:
+  en: af91ab9dee9b86b2
+  zh: 06320b6cf61c07f7
+/agent-note-keep-the-tauri-application-a-thin-web-shell/decision:
+  en: f3d4300195632c65
+  zh: c18651bccdd5f6bd
+/agent-note-keep-the-tauri-application-a-thin-web-shell/verification:
+  en: 123546e88e5a5f51
+  zh: 4e06bf03095f3251
+/agent-note-keep-the-tauri-application-a-thin-web-shell/alternatives-considered:
+  en: 4b0f51f5b1801f62
+  zh: d3af5b11797f7e08
+/agent-note-keep-the-tauri-application-a-thin-web-shell/consequences:
+  en: 486ff8e16f66c037
+  zh: 5ad20966a1dcead1

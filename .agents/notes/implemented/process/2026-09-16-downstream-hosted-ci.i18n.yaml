@@ -1,0 +1,19 @@
+# Bilingual-pair consistency record for 2026-09-16-downstream-hosted-ci.md (docs/i18n/README.md): per heading
+# section, a hash of its English and Chinese blocks outside code blocks and generated regions.
+# After editing either side, bring the other along and re-record with:
+#   pnpm run verify-translation-pairing --write .agents/notes/implemented/process/2026-09-16-downstream-hosted-ci.md
+/agent-note-keep-downstream-ci-on-public-hosted-runners:
+  en: 03b0cd9f07e9cd54
+  zh: 84279b97bd6bf942
+/agent-note-keep-downstream-ci-on-public-hosted-runners/problem:
+  en: 15d039b1e6c15ac4
+  zh: 70d1ec27471b2ddc
+/agent-note-keep-downstream-ci-on-public-hosted-runners/decision:
+  en: ff16c94ef661cd2a
+  zh: a1bf2c55146bdd66
+/agent-note-keep-downstream-ci-on-public-hosted-runners/alternatives-considered:
+  en: e54bc7e029697652
+  zh: 73ac3dd76f68411b
+/agent-note-keep-downstream-ci-on-public-hosted-runners/consequences:
+  en: 03e0cfdf492faf93
+  zh: a5c1612506fd1337

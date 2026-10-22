@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-tauri",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.1-rc.2",
   "description": "Tauri macOS desktop shell over the DeepSeek Harness Web GUI (dsh --profile web)",
   "type": "module",
   "scripts": {
