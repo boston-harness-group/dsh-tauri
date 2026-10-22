@@ -1,11 +1,10 @@
 /** Exercise the packaged macOS sidecar through its shipped HTTP, image, and PTY paths. */
 import { spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { constants } from 'node:fs'
 import { createServer } from 'node:http'
-import { access, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { access, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { basename, delimiter, join, resolve } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import WebSocket from 'ws'
@@ -146,34 +145,32 @@ let desktopSpawnError: Error | undefined
 let output = ''
 let detachedPid: string | undefined
 
-async function prepareSourcePreset(): Promise<string> {
-  if (!values['source-cli']) return 'minimal'
-  const shellPath = await findOnPath('bash')
-  const sourceDir = join(repoRoot, 'packages/preset/agent-presets/presets/minimal')
-  const composition = await readFile(join(sourceDir, 'agent.cordis.yml'), 'utf8')
-  const anchor = "    - id: terminal-bash\n      name: '@deepseek-ai/dsh-terminal-bash'\n      disabled: !!js process.platform === 'win32'\n      config:\n"
-  if (!composition.includes(anchor)) throw new Error('minimal preset terminal-bash row changed')
-  const targetDir = join(world, 'dsh-home', '.agent-presets', 'tauri-smoke')
-  await mkdir(targetDir, { recursive: true })
-  await writeFile(join(targetDir, 'agent.cordis.yml'), composition.replace(
-    anchor,
-    `${anchor}        shellPath: ${JSON.stringify(shellPath)}\n`,
-  ))
-  await writeFile(join(targetDir, 'preset.yml'), 'name: Tauri source smoke\ndescription: Test-only real PTY composition.\norder: 99\n')
-  return 'tauri-smoke'
+type ProcessOutcome =
+  | { kind: 'error'; error: Error }
+  | { kind: 'exit'; code: number | null; signal: NodeJS.Signals | null }
+
+function observeOutcome(process: ChildProcess): Promise<ProcessOutcome> {
+  return new Promise((resolveOutcome) => {
+    process.once('error', (error) => { resolveOutcome({ kind: 'error', error }) })
+    process.once('exit', (code, signal) => { resolveOutcome({ kind: 'exit', code, signal }) })
+  })
 }
 
-async function findOnPath(name: string): Promise<string> {
-  for (const directory of (process.env.PATH ?? '').split(delimiter)) {
-    const candidate = join(directory, name)
-    try {
-      await access(candidate, constants.X_OK)
-      return candidate
-    } catch {
-      // Continue through PATH; failure means this candidate is absent or not executable.
-    }
+function captureProcessOutput(process: ChildProcess): () => string {
+  const chunks: Buffer[] = []
+  let byteCount = 0
+  const append = (chunk: Buffer): void => {
+    byteCount += chunk.length
+    if (byteCount <= 1024 * 1024) chunks.push(chunk)
   }
-  throw new Error(`${name} is not executable on PATH`)
+  process.stdout?.on('data', append)
+  process.stderr?.on('data', append)
+  return () => Buffer.concat(chunks).toString('utf8')
+}
+
+function describeOutcome(outcome: ProcessOutcome, captured: string): string {
+  if (outcome.kind === 'error') return `failed to start: ${outcome.error.stack ?? outcome.error.message}`
+  return `exited with code ${String(outcome.code)}, signal ${String(outcome.signal)}${captured === '' ? '' : `:\n${captured}`}`
 }
 
 function cleanEnvironment(): NodeJS.ProcessEnv {
@@ -358,7 +355,7 @@ async function capture(command: string, args: string[], timeoutMs = 5_000): Prom
   }
   captured.stdout.on('data', append)
   captured.stderr.on('data', append)
-  const code = await new Promise<number | null>((resolveExit, reject) => {
+  const outcome = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit, reject) => {
     const timer = setTimeout(() => {
       captured.kill('SIGKILL')
       reject(new Error(`${command} ${args.join(' ')} timed out after ${timeoutMs}ms`))
@@ -367,21 +364,25 @@ async function capture(command: string, args: string[], timeoutMs = 5_000): Prom
       clearTimeout(timer)
       reject(new Error(`failed to start ${command}`, { cause: error }))
     })
-    captured.once('exit', (exitCode) => {
+    captured.once('exit', (code, signal) => {
       clearTimeout(timer)
-      resolveExit(exitCode)
+      resolveExit({ code, signal })
     })
   })
-  if (code !== 0) throw new Error(`${command} ${args.join(' ')} exited ${code}: ${Buffer.concat(chunks).toString('utf8')}`)
+  if (outcome.code !== 0 || outcome.signal !== null) {
+    throw new Error(`${command} ${args.join(' ')} exited with code ${String(outcome.code)}, signal ${String(outcome.signal)}: ${Buffer.concat(chunks).toString('utf8')}`)
+  }
   return Buffer.concat(chunks).toString('utf8')
 }
 
-async function waitForDesktopHost(appProcess: ChildProcess): Promise<{ pid: number; url: string }> {
+async function waitForDesktopHost(appProcess: ChildProcess, capturedOutput: () => string): Promise<{ pid: number; url: string }> {
   if (appProcess.pid === undefined) throw new Error('desktop app has no pid')
   const deadline = Date.now() + 30_000
   while (Date.now() < deadline) {
     if (desktopSpawnError !== undefined) throw new Error('failed to start desktop app', { cause: desktopSpawnError })
-    if (appProcess.exitCode !== null) throw new Error(`desktop app exited during startup (${appProcess.exitCode})`)
+    if (appProcess.exitCode !== null || appProcess.signalCode !== null) {
+      throw new Error(`desktop app exited during startup with code ${String(appProcess.exitCode)}, signal ${String(appProcess.signalCode)}:\n${capturedOutput()}`)
+    }
     const table = await capture('ps', ['-axo', 'pid=,ppid=,comm='])
     const childLine = table.split('\n').find((line) => {
       const fields = /^\s*(\d+)\s+(\d+)\s+(.+?)\s*$/.exec(line)
@@ -400,7 +401,46 @@ async function waitForDesktopHost(appProcess: ChildProcess): Promise<{ pid: numb
     }
     await new Promise(resolveDelay => setTimeout(resolveDelay, 250))
   }
-  throw new Error('desktop app did not start a listening dsh-web child')
+  throw new Error(`desktop app did not start a listening dsh-web child:\n${capturedOutput()}`)
+}
+
+async function nativeApplicationStatus(appProcess: ChildProcess): Promise<'missing' | 'launching' | 'ready'> {
+  if (appProcess.pid === undefined) throw new Error('desktop app has no pid')
+  const script = [
+    'ObjC.import("AppKit")',
+    `const app = $.NSRunningApplication.runningApplicationWithProcessIdentifier(${appProcess.pid})`,
+    'app.isNil() ? "missing" : (app.finishedLaunching ? "ready" : "launching")',
+  ].join('\n')
+  const status = (await capture('osascript', ['-l', 'JavaScript', '-e', script])).trim()
+  if (status === 'missing' || status === 'launching' || status === 'ready') return status
+  throw new Error(`AppKit returned an unknown desktop application status: ${status}`)
+}
+
+async function waitForDesktopApplication(appProcess: ChildProcess, capturedOutput: () => string): Promise<void> {
+  const deadline = Date.now() + 30_000
+  let status: 'missing' | 'launching' | 'ready' = 'missing'
+  while (Date.now() < deadline) {
+    if (desktopSpawnError !== undefined) throw new Error('failed to start desktop app', { cause: desktopSpawnError })
+    if (appProcess.exitCode !== null || appProcess.signalCode !== null) {
+      throw new Error(`desktop app exited during native launch with code ${String(appProcess.exitCode)}, signal ${String(appProcess.signalCode)}:\n${capturedOutput()}`)
+    }
+    status = await nativeApplicationStatus(appProcess)
+    if (status === 'ready') return
+    await new Promise(resolveDelay => setTimeout(resolveDelay, 100))
+  }
+  throw new Error(`desktop app did not finish native launch (last AppKit status: ${status}):\n${capturedOutput()}`)
+}
+
+async function requestDesktopQuit(appProcess: ChildProcess): Promise<void> {
+  if (appProcess.pid === undefined) throw new Error('desktop app has no pid')
+  const script = [
+    'ObjC.import("AppKit")',
+    `const app = $.NSRunningApplication.runningApplicationWithProcessIdentifier(${appProcess.pid})`,
+    'if (app.isNil()) throw new Error("desktop application is not registered with AppKit")',
+    'app.terminate ? "requested" : "refused"',
+  ].join('\n')
+  const result = (await capture('osascript', ['-l', 'JavaScript', '-e', script])).trim()
+  if (result !== 'requested') throw new Error(`AppKit refused the desktop Quit request: ${result}`)
 }
 
 async function waitForPidExit(pid: number, label: string): Promise<void> {
@@ -455,8 +495,12 @@ async function stopPid(pid: number): Promise<void> {
   }
 }
 
+let primaryFailure: unknown
 try {
-  const agentPreset = await prepareSourcePreset()
+  // The shipped `minimal` preset's `terminal-bash` row resolves its own default
+  // shell (`/bin/bash`), so the smoke selects the preset by id rather than
+  // composing one. A real PTY still backs the persistent-shell probe below.
+  const agentPreset = 'minimal'
   const command = sidecar ?? process.execPath
   const commandArgs = sidecar === undefined
     ? ['--import', import.meta.resolve('tsx/esm'), join(repoRoot, 'apps/cli/src/bin.ts'), 'web', '--port', '0', '--no-open']
@@ -479,7 +523,7 @@ try {
     request: { cwd: world, agentPreset },
   })
   await rpc(baseUrl, 'session/selectModel', { request: {
-    sessionId: created.sessionId, provider: 'deepseek-official', model: 'deepseek-v4-flash-vision-exp',
+    sessionId: created.sessionId, provider: 'deepseek-official', model: 'deepseek-v4-flash',
   } })
   const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
   await rpc(baseUrl, 'session/prompt', { request: {
@@ -548,17 +592,20 @@ try {
   if (!searchCompleted) {
     throw new Error(`ripgrep/model turn did not complete; history=${searchHistory}`)
   }
-  const settingsPath = join(world, 'dsh-home', 'settings.yaml')
+  // Settings persist through the active profile's patch
+  // (`$DSH_HOME/profiles/<profile>/cordis.patch.yml`), not a standalone file.
+  // The `web` profile owns the welcome acknowledgement in `ui-settings-general`.
+  const settingsPath = join(world, 'dsh-home', 'profiles', 'web', 'cordis.patch.yml')
   const described = await rpc<{ namespaces: Array<{ ns: string; revision: number }> }>(baseUrl, 'settings/describe', {})
-  const onboarding = described.namespaces.find(namespace => namespace.ns === 'ui-onboarding')
-  if (onboarding === undefined) throw new Error('settings describe omitted ui-onboarding')
+  const general = described.namespaces.find(namespace => namespace.ns === 'ui-settings-general')
+  if (general === undefined) throw new Error('settings describe omitted ui-settings-general')
   await rpc(baseUrl, 'settings/mutate', {
-    ns: 'ui-onboarding',
+    ns: 'ui-settings-general',
     ops: [{ op: 'set', path: ['welcomeNoticeVersion'], value: 'tauri-bundle-smoke' }],
-    expectedRevision: onboarding.revision,
+    expectedRevision: general.revision,
   })
   if (!(await readFile(settingsPath, 'utf8')).includes('tauri-bundle-smoke')) {
-    throw new Error('settings RPC did not persist to isolated DSH_HOME')
+    throw new Error('settings RPC did not persist to the isolated profile patch')
   }
   try {
     process.kill(Number(detachedPid), 0)
@@ -590,45 +637,71 @@ try {
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     desktop = desktopProcess
+    const desktopOutcome = observeOutcome(desktopProcess)
+    const desktopOutput = captureProcessOutput(desktopProcess)
     desktopProcess.once('error', (error) => { desktopSpawnError = error })
-    desktopProcess.stdout.resume()
-    desktopProcess.stderr.resume()
-    const host = await waitForDesktopHost(desktopProcess)
+    console.log(`tauri desktop quit smoke: spawned app pid ${String(desktopProcess.pid)}`)
+    const host = await waitForDesktopHost(desktopProcess, desktopOutput)
     desktopHostPid = host.pid
-    const desktopExited = desktopProcess.exitCode !== null
-      ? Promise.reject(new Error(`desktop app exited with ${desktopProcess.exitCode}`))
-      : new Promise<void>((resolveExit, reject) => {
-        desktopProcess.once('error', (error) => {
-          reject(new Error('desktop app failed after startup', { cause: error }))
-        })
-        desktopProcess.once('exit', (code) => {
-          if (code === 0) resolveExit()
-          else reject(new Error(`desktop app exited with ${code}`))
-        })
-      })
-    await capture('osascript', ['-e', 'tell application id "ai.deepseek.harness" to quit'])
-    await Promise.race([
-      desktopExited,
+    console.log(`tauri desktop quit smoke: host ready appPid=${String(desktopProcess.pid)} childPid=${host.pid} url=${host.url}`)
+    await waitForDesktopApplication(desktopProcess, desktopOutput)
+    console.log(`tauri desktop quit smoke: native application finished launching appPid=${String(desktopProcess.pid)}`)
+    try {
+      await requestDesktopQuit(desktopProcess)
+    } catch (error) {
+      throw new Error(
+        `normal Quit request failed; desktop code=${String(desktopProcess.exitCode)}, signal=${String(desktopProcess.signalCode)}:\n${desktopOutput()}`,
+        { cause: error },
+      )
+    }
+    const outcome = await Promise.race([
+      desktopOutcome,
       new Promise<never>((_resolve, reject) => {
         setTimeout(() => { reject(new Error('desktop app ignored normal Quit')) }, 10_000)
       }),
     ])
+    if (outcome.kind === 'error' || outcome.code !== 0 || outcome.signal !== null) {
+      throw new Error(`desktop app ${describeOutcome(outcome, desktopOutput())}`)
+    }
     await waitForPidExit(host.pid, 'desktop dsh-web child')
     console.log(`tauri desktop quit smoke: app exited and stopped child ${host.pid} from ${host.url}`)
   }
+} catch (error) {
+  primaryFailure = error
 } finally {
-  if (child !== undefined) await stopChild(child, 'sidecar')
-  if (desktop !== undefined) await stopChild(desktop, 'desktop app')
-  if (desktopHostPid !== undefined) await stopPid(desktopHostPid)
-  if (detachedPid !== undefined) {
+  const cleanupFailures: unknown[] = []
+  const cleanup = async (action: () => void | Promise<void>): Promise<void> => {
     try {
-      process.kill(Number(detachedPid), 'SIGTERM')
+      await action()
+    } catch (error) {
+      cleanupFailures.push(error)
+    }
+  }
+  const sidecarProcess = child
+  const desktopProcess = desktop
+  const hostPid = desktopHostPid
+  const ptyPid = detachedPid
+  if (sidecarProcess !== undefined) await cleanup(async () => { await stopChild(sidecarProcess, 'sidecar') })
+  if (desktopProcess !== undefined) await cleanup(async () => { await stopChild(desktopProcess, 'desktop app') })
+  if (hostPid !== undefined) await cleanup(async () => { await stopPid(hostPid) })
+  if (ptyPid !== undefined) await cleanup(() => {
+    try {
+      process.kill(Number(ptyPid), 'SIGTERM')
     } catch (error) {
       if (!isMissingProcess(error)) throw error
     }
+  })
+  await cleanup(async () => {
+    await new Promise<void>((resolveClose) => { provider.close(() => { resolveClose() }) })
+  })
+  await cleanup(async () => { await rm(world, { recursive: true, force: true }) })
+  if (primaryFailure !== undefined) {
+    if (cleanupFailures.length > 0) console.error('tauri smoke cleanup failures:', ...cleanupFailures)
+    throw primaryFailure instanceof Error
+      ? primaryFailure
+      : new Error('tauri smoke failed with a non-Error value', { cause: primaryFailure })
   }
-  await new Promise<void>((resolveClose) => { provider.close(() => { resolveClose() }) })
-  await rm(world, { recursive: true, force: true })
+  if (cleanupFailures.length > 0) throw new AggregateError(cleanupFailures, 'tauri smoke cleanup failed')
 }
 
 function isMissingProcess(error: unknown): boolean {
