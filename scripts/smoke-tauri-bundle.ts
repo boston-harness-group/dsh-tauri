@@ -523,7 +523,7 @@ try {
     request: { cwd: world, agentPreset },
   })
   await rpc(baseUrl, 'session/selectModel', { request: {
-    sessionId: created.sessionId, provider: 'deepseek-official', model: 'deepseek-v4-flash',
+    sessionId: created.sessionId, provider: 'deepseek-official', model: 'deepseek-flash',
   } })
   const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='
   await rpc(baseUrl, 'session/prompt', { request: {
