@@ -1,6 +1,6 @@
 # Tauri fork
 
-This branch carries a narrow Tauri macOS carrier over the `dsh-v0.2.1-rc.2` upstream DeepSeek Harness revision (`687f282e8625c6b8d11ff58211a90524be2e4317`). Run `git merge-base HEAD upstream/master` to recover the base revision. The branch ports intent rather than replaying the earlier fork history.
+This branch carries a narrow Tauri macOS carrier over the `dsh-v0.2.1-rc.2` upstream DeepSeek Harness revision. Run `git merge-base HEAD upstream/master` to recover the base revision. The branch ports intent rather than replaying the earlier fork history.
 
 ## Patch inventory
 

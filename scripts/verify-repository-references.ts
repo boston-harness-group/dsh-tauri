@@ -32,7 +32,8 @@ function isMaintained(file: string): boolean {
 }
 
 /**
- * Inspect a maintained source file against known commit identifiers.
+ * Inspect a maintained source file against known commit identifiers. Decimal
+ * wheel sizes in uv.lock are not repository references.
  * @param file - Repository-relative path used in diagnostics and exclusions.
  * @param source - File text or a symlink's stored target.
  * @param commits - Lowercase, unambiguous full or abbreviated commit identifiers.
@@ -49,7 +50,11 @@ export function findRepositoryReferences(
     if (organizationUrl.test(canonicalReferenceText(line).replace(kitRepositoryUrl, ''))) {
       references.push({ file, line: index + 1, kind: 'organization-url' })
     }
-    if ([...line.matchAll(commitCandidate)].some(match => commits.has(match[0].toLowerCase()))) {
+    if ([...line.matchAll(commitCandidate)].some((match) => {
+      if (/(^|\/)uv\.lock$/u.test(file) && /^\d+$/u.test(match[0])
+        && /\bsize\s*=\s*$/u.test(line.slice(0, match.index))) return false
+      return commits.has(match[0].toLowerCase())
+    })) {
       references.push({ file, line: index + 1, kind: 'commit-hash' })
     }
   }

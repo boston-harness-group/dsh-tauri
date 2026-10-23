@@ -81,6 +81,14 @@ describe('maintained repository reference policy', () => {
     }
   })
 
+  it('ignores a uv.lock wheel size even when its digits identify a commit', () => {
+    const commit = ['634', '4383'].join('')
+    const source = `wheel = { size = ${commit}, hash = "sha256:abc" }\ncommit ${commit}\n`
+    expect(findRepositoryReferences('python/sdk/uv.lock', source, new Set([commit]))).toEqual([
+      { file: 'python/sdk/uv.lock', line: 2, kind: 'commit-hash' },
+    ])
+  })
+
   it('rejects complete and abbreviated commit identifiers in tracked, staged, and new files', (test) => {
     const fixture = repository(test)
     fixture.write('tracked.md', `release\n${fixture.commit}\n${fixture.commit.toUpperCase()}\n`)
